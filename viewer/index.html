@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nano IMU - Visualizador 3D do iPhone</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden;
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+      background: #0b0e14; color: #e6e9ef; }
+    #scene { position: fixed; inset: 0; }
+    #panel {
+      position: fixed; top: 16px; left: 16px; z-index: 10;
+      background: rgba(20,24,33,.85); backdrop-filter: blur(8px);
+      border-radius: 14px; padding: 16px; width: 300px; max-width: calc(100vw - 32px);
+    }
+    h1 { font-size: 1rem; margin: 0 0 12px; }
+    button {
+      width: 100%; padding: 12px; font-size: .95rem; font-weight: 600;
+      border: none; border-radius: 10px; cursor: pointer; margin-bottom: 8px;
+      background: #2f6df6; color: #fff;
+    }
+    button:disabled { background: #333a49; color: #7c8698; cursor: default; }
+    button.secondary { background: #333a49; color: #e6e9ef; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 10px 0; }
+    .cell { background: #10131a; border-radius: 8px; padding: 8px 4px; text-align: center; }
+    .cell .k { font-size: .7rem; color: #8a93a6; }
+    .cell .v { font-size: 1.1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    #status { font-size: .8rem; color: #8a93a6; min-height: 1.1em; }
+    .hint { font-size: .72rem; color: #707a8e; margin-top: 10px; line-height: 1.4; }
+    #raw { font-family: ui-monospace, Consolas, monospace; font-size: .68rem;
+      color: #6b7488; margin-top: 8px; word-break: break-all; min-height: 1.1em; }
+
+    #maze {
+      position: fixed; top: 16px; right: 16px; z-index: 10;
+      background: rgba(20,24,33,.85); backdrop-filter: blur(8px);
+      border-radius: 14px; padding: 16px; width: 380px; max-width: calc(100vw - 32px);
+    }
+    #mazeCanvas { width: 100%; height: auto; display: block; border-radius: 10px;
+      background: #10131a; touch-action: none; }
+    #mazeStatus { font-size: .85rem; color: #8a93a6; margin: 10px 0 6px; min-height: 1.1em; }
+    #mazeStatus.win { color: #51cf66; font-weight: 700; }
+    .maze-hint { font-size: .72rem; color: #707a8e; line-height: 1.4; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div id="scene"></div>
+
+  <div id="maze">
+    <h1>Labirinto (incline o celular)</h1>
+    <canvas id="mazeCanvas" width="360" height="360"></canvas>
+    <div id="mazeStatus">Calibre com "Zerar posicao" e incline para mover a bola.</div>
+    <button id="btnRestart" class="secondary">Reiniciar labirinto</button>
+    <div class="maze-hint">
+      A bola (azul) parte do canto e deve chegar na saida (verde). Desvie dos
+      buracos escuros: cair reinicia no ultimo checkpoint (losango amarelo).
+      A inclinacao neutra e a que voce definiu no botao "Zerar posicao".
+    </div>
+  </div>
+
+  <div id="panel">
+    <h1>iPhone 3D em tempo real</h1>
+    <button id="btnConnect">Conectar a serial (Nano)</button>
+    <button id="btnDisconnect" class="secondary" disabled>Desconectar</button>
+    <button id="btnZero" class="secondary">Zerar posicao (calibrar)</button>
+
+    <div class="grid">
+      <div class="cell"><div class="k">beta</div><div class="v" id="vBeta">--</div></div>
+      <div class="cell"><div class="k">gamma</div><div class="v" id="vGamma">--</div></div>
+      <div class="cell"><div class="k">alpha</div><div class="v" id="vAlpha">--</div></div>
+    </div>
+
+    <div id="status">Feche o Serial Monitor do Arduino antes de conectar.</div>
+    <div id="raw"></div>
+    <div class="hint">
+      Use Chrome ou Edge no desktop. A porta serial so pode ser aberta por um
+      programa por vez, entao mantenha o Serial Monitor fechado.
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // ---------- Cena 3D ----------
+    const container = document.getElementById('scene');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e14);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 9);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    key.position.set(5, 8, 6);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0x4dabf7, 0.5);
+    rim.position.set(-6, -3, -4);
+    scene.add(rim);
+
+    // ---------- Modelo do iPhone (estilizado) ----------
+    // Grupo "phone": eixos do celular. Aplicamos a orientacao neste grupo.
+    const phone = new THREE.Group();
+    scene.add(phone);
+
+    function roundedBoxShape(w, h, r) {
+      const s = new THREE.Shape();
+      const x = -w / 2, y = -h / 2;
+      s.moveTo(x + r, y);
+      s.lineTo(x + w - r, y);
+      s.quadraticCurveTo(x + w, y, x + w, y + r);
+      s.lineTo(x + w, y + h - r);
+      s.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      s.lineTo(x + r, y + h);
+      s.quadraticCurveTo(x, y + h, x, y + h - r);
+      s.lineTo(x, y + r);
+      s.quadraticCurveTo(x, y, x + r, y);
+      return s;
+    }
+
+    const W = 3.0, H = 6.2, D = 0.55, R = 0.55;
+    const bodyGeo = new THREE.ExtrudeGeometry(roundedBoxShape(W, H, R), {
+      depth: D, bevelEnabled: true, bevelThickness: 0.08, bevelSize: 0.08, bevelSegments: 3, curveSegments: 16,
+    });
+    bodyGeo.center();
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x1b2230, metalness: 0.6, roughness: 0.35 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    phone.add(body);
+
+    // Tela (na face +Z)
+    const screenGeo = new THREE.PlaneGeometry(W - 0.5, H - 0.5);
+    const screenMat = new THREE.MeshStandardMaterial({ color: 0x0a0f1a, emissive: 0x0d1b3a, emissiveIntensity: 0.6, roughness: 0.2 });
+    const screen = new THREE.Mesh(screenGeo, screenMat);
+    screen.position.z = D / 2 + 0.12;
+    phone.add(screen);
+
+    // Notch (marca o topo do aparelho, para dar referencia de orientacao)
+    const notchGeo = new THREE.BoxGeometry(1.1, 0.28, 0.05);
+    const notchMat = new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.5 });
+    const notch = new THREE.Mesh(notchGeo, notchMat);
+    notch.position.set(0, H / 2 - 0.55, D / 2 + 0.14);
+    phone.add(notch);
+
+    // Camera bump (face traseira, canto superior) para diferenciar frente/tras
+    const camGeo = new THREE.BoxGeometry(1.0, 1.0, 0.18);
+    const camMat = new THREE.MeshStandardMaterial({ color: 0x0e131d, metalness: 0.5, roughness: 0.4 });
+    const camBump = new THREE.Mesh(camGeo, camMat);
+    camBump.position.set(-W / 2 + 0.85, H / 2 - 0.9, -D / 2 - 0.09);
+    phone.add(camBump);
+
+    // Marcador "TOPO" verde no topo, ajuda a ler a orientacao
+    const topGeo = new THREE.BoxGeometry(W - 1.2, 0.12, 0.05);
+    const topMat = new THREE.MeshStandardMaterial({ color: 0x51cf66, emissive: 0x2f8f3f });
+    const topMark = new THREE.Mesh(topGeo, topMat);
+    topMark.position.set(0, H / 2 - 0.15, D / 2 + 0.14);
+    phone.add(topMark);
+
+    // ---------- Aplicacao da orientacao ----------
+    // Angulos-alvo (graus) vindos da serial; interpolamos suavemente ate eles.
+    // Convencao W3C DeviceOrientation: ordem de rotacao 'ZXY'
+    // (alpha em Z, beta em X, gamma em Y). Aplicada no loop animate().
+    const target = { alpha: 0, beta: 0, gamma: 0 };
+    const DEG = Math.PI / 180;
+
+    const rawEuler = new THREE.Euler();     // orientacao bruta vinda da serial
+    const rawQuat = new THREE.Quaternion(); // idem, como quaternion
+    const offsetQuat = new THREE.Quaternion(); // calibracao (identidade = sem offset)
+    const desiredQuat = new THREE.Quaternion(); // pose final a exibir
+
+    function animate() {
+      requestAnimationFrame(animate);
+      // 1) Orientacao bruta do celular (convencao W3C ZXY).
+      rawToEuler(rawEuler);
+      rawQuat.setFromEuler(rawEuler);
+      // 2) Aplica a calibracao: exibida = offset * bruta.
+      desiredQuat.copy(offsetQuat).multiply(rawQuat);
+      // 3) Suavizacao via slerp.
+      phone.quaternion.slerp(desiredQuat, 0.15);
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Converte os angulos atuais (target) para Euler ZXY.
+    // Mapeamento de eixos (ajustado ao comportamento fisico observado):
+    //   beta  -> eixo X (frente/tras)
+    //   gamma -> eixo Y (esquerda/direita)
+    //   alpha -> eixo Z (giro no plano)
+    // gamma e alpha entram positivos (sinais ajustados ao movimento real).
+    function rawToEuler(euler) {
+      euler.set(target.beta * DEG, target.gamma * DEG, target.alpha * DEG, 'ZXY');
+    }
+
+    // Zerar: captura a orientacao bruta atual e define o offset como seu inverso,
+    // de modo que a pose atual passe a ser a identidade (posicao 0).
+    function zeroPosition() {
+      rawToEuler(rawEuler);
+      rawQuat.setFromEuler(rawEuler);
+      offsetQuat.copy(rawQuat).invert();
+      // Calibra tambem o labirinto: a inclinacao atual vira o "plano neutro".
+      mazeNeutral.beta = target.beta;
+      mazeNeutral.gamma = target.gamma;
+      statusEl.textContent = 'Posicao zerada nesta orientacao.';
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ================= LABIRINTO =================
+    // Inclinacao neutra (definida pelo botao "Zerar"). A aceleracao da bola
+    // vem da diferenca entre a inclinacao atual e essa referencia.
+    const mazeNeutral = { beta: 0, gamma: 0 };
+
+    const mazeCanvas = document.getElementById('mazeCanvas');
+    const mctx = mazeCanvas.getContext('2d');
+    const mazeStatus = document.getElementById('mazeStatus');
+
+    // Layout do labirinto: '#' parede, ' ' livre, 'S' inicio, 'E' saida.
+    // Labirinto perfeito (gerado por backtracker, caminho S->E garantido).
+    const MAZE = [
+      "###############",
+      "#S#       #   #",
+      "# ### ### # # #",
+      "#   #   #   # #",
+      "### ### ##### #",
+      "# #   #   # # #",
+      "# ### # # # # #",
+      "# #   # # #   #",
+      "# # ##### ### #",
+      "# # #   #   # #",
+      "# # # # ### # #",
+      "# #   #     # #",
+      "# ########### #",
+      "#            E#",
+      "###############",
+    ];
+    const ROWS = MAZE.length;
+    const COLS = MAZE[0].length;
+    const CANVAS = 360;               // canvas quadrado
+    const CELL = CANVAS / COLS;       // tamanho de cada celula em px
+    const BALL_R = CELL * 0.30;       // raio da bola
+
+    // Posicoes de inicio e saida (centro das celulas correspondentes).
+    let startPx = { x: 0, y: 0 };
+    let exitCell = { r: 0, c: 0 };
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (MAZE[r][c] === 'S') startPx = { x: (c + 0.5) * CELL, y: (r + 0.5) * CELL };
+        if (MAZE[r][c] === 'E') exitCell = { r, c };
+      }
+    }
+
+    // Obstaculos, definidos por celula (r,c). Ficam sobre o caminho da solucao.
+    // Buracos: se a bola cair, volta ao ultimo respawn (inicio ou checkpoint).
+    // Buracos posicionados em CURVAS do caminho: ali a bola passa pela borda
+    // interna, entao da para desviar do centro. Em corredores retos de largura 1
+    // um buraco seria intransponivel, por isso evitamos retas.
+    const HOLES = [
+      { r: 5, c: 5 },
+      { r: 9, c: 5 },
+      { r: 3, c: 7 },
+      { r: 9, c: 11 },
+    ];
+    // Checkpoint: ao passar por ele, vira o novo ponto de respawn.
+    const CHECKPOINT = { r: 11, c: 7 };
+
+    const cellCenter = (cell) => ({ x: (cell.c + 0.5) * CELL, y: (cell.r + 0.5) * CELL });
+    const HOLE_R = CELL * 0.26;         // raio visual do buraco (menor = mais folga)
+    const FALL_R = CELL * 0.16;         // dist. do centro da bola ao centro do buraco p/ cair
+
+    const ball = { x: 0, y: 0, vx: 0, vy: 0, scale: 1 };
+    let won = false;
+    let falling = false;                // animacao de queda em andamento
+    let falls = 0;                      // contador de quedas
+    let respawn = { x: 0, y: 0 };       // ponto de renascimento atual
+    let checkpointReached = false;
+
+    function resetMaze() {
+      respawn = { x: startPx.x, y: startPx.y };
+      checkpointReached = false;
+      falls = 0;
+      placeBallAtRespawn();
+      won = false;
+      mazeStatus.textContent = 'Incline o celular para mover a bola ate a saida.';
+      mazeStatus.classList.remove('win');
+    }
+
+    function placeBallAtRespawn() {
+      ball.x = respawn.x; ball.y = respawn.y;
+      ball.vx = 0; ball.vy = 0;
+      ball.scale = 1;
+      falling = false;
+    }
+    resetMaze();
+
+    function isWall(r, c) {
+      if (r < 0 || c < 0 || r >= ROWS || c >= COLS) return true;
+      return MAZE[r][c] === '#';
+    }
+
+    // Resolve colisao da bola (circulo) contra as celulas-parede vizinhas.
+    function collide() {
+      const cr = Math.floor(ball.y / CELL);
+      const cc = Math.floor(ball.x / CELL);
+      for (let r = cr - 1; r <= cr + 1; r++) {
+        for (let c = cc - 1; c <= cc + 1; c++) {
+          if (!isWall(r, c)) continue;
+          // Ponto mais proximo do retangulo da celula ao centro da bola.
+          const rx = c * CELL, ry = r * CELL;
+          const nx = Math.max(rx, Math.min(ball.x, rx + CELL));
+          const ny = Math.max(ry, Math.min(ball.y, ry + CELL));
+          let dx = ball.x - nx, dy = ball.y - ny;
+          let dist = Math.hypot(dx, dy);
+          if (dist < BALL_R) {
+            if (dist === 0) { dx = 0; dy = -1; dist = 1; } // caso degenerado
+            const push = (BALL_R - dist);
+            ball.x += (dx / dist) * push;
+            ball.y += (dy / dist) * push;
+            // Remove a componente da velocidade na direcao da normal (com amortecimento).
+            const nX = dx / dist, nY = dy / dist;
+            const vn = ball.vx * nX + ball.vy * nY;
+            ball.vx -= (1 + 0.2) * vn * nX;
+            ball.vy -= (1 + 0.2) * vn * nY;
+          }
+        }
+      }
+    }
+
+    function checkWin() {
+      const cr = Math.floor(ball.y / CELL);
+      const cc = Math.floor(ball.x / CELL);
+      if (cr === exitCell.r && cc === exitCell.c && !won) {
+        won = true;
+        mazeStatus.textContent = 'Voce chegou na saida! Quedas: ' + falls + ' 🎉';
+        mazeStatus.classList.add('win');
+      }
+    }
+
+    function checkCheckpoint() {
+      if (checkpointReached) return;
+      const p = cellCenter(CHECKPOINT);
+      if (Math.hypot(ball.x - p.x, ball.y - p.y) < CELL * 0.4) {
+        checkpointReached = true;
+        respawn = { x: p.x, y: p.y };
+        mazeStatus.textContent = 'Checkpoint alcancado! Renasce aqui se cair.';
+      }
+    }
+
+    function checkHoles() {
+      for (const h of HOLES) {
+        const p = cellCenter(h);
+        if (Math.hypot(ball.x - p.x, ball.y - p.y) < FALL_R) {
+          // A bola caiu: inicia a animacao de queda e conta.
+          falling = true;
+          falls++;
+          // Puxa suavemente a bola para o centro do buraco durante a queda.
+          ball.x = p.x; ball.y = p.y;
+          ball.vx = 0; ball.vy = 0;
+          mazeStatus.textContent = 'Caiu no buraco! Quedas: ' + falls;
+          mazeStatus.classList.remove('win');
+          return;
+        }
+      }
+    }
+
+    const ACCEL = 900;    // px/s^2 por unidade de inclinacao (ajustavel)
+    const FRICTION = 2.2; // atrito viscoso (1/s)
+    const MAX_TILT = 35;  // graus de inclinacao que dao aceleracao maxima
+    let lastT = performance.now();
+
+    function mazeStep(now) {
+      requestAnimationFrame(mazeStep);
+      let dt = (now - lastT) / 1000;
+      lastT = now;
+      if (dt > 0.05) dt = 0.05; // clamp para evitar saltos apos travadas
+
+      if (falling) {
+        // Animacao de queda: encolhe a bola e depois renasce no respawn.
+        ball.scale -= dt * 3.5;
+        if (ball.scale <= 0.05) {
+          placeBallAtRespawn();
+        }
+      } else if (!won) {
+        // Inclinacao relativa ao neutro, normalizada e limitada.
+        const tiltX = clampTilt(target.gamma - mazeNeutral.gamma) / MAX_TILT; // esq/dir
+        const tiltY = clampTilt(target.beta  - mazeNeutral.beta ) / MAX_TILT; // frente/tras
+        // gamma inclina para os lados -> eixo X; beta inclina frente/tras -> eixo Y.
+        ball.vx += tiltX * ACCEL * dt;
+        ball.vy += tiltY * ACCEL * dt;
+        // Atrito.
+        ball.vx -= ball.vx * FRICTION * dt;
+        ball.vy -= ball.vy * FRICTION * dt;
+        // Integra posicao (subpassos para colisao estavel).
+        const steps = 4;
+        for (let i = 0; i < steps; i++) {
+          ball.x += (ball.vx * dt) / steps;
+          ball.y += (ball.vy * dt) / steps;
+          collide();
+        }
+        checkCheckpoint();
+        checkHoles();
+        checkWin();
+      }
+      drawMaze();
+    }
+
+    function clampTilt(deg) {
+      if (deg >  MAX_TILT) return  MAX_TILT;
+      if (deg < -MAX_TILT) return -MAX_TILT;
+      return deg;
+    }
+
+    function drawMaze() {
+      mctx.clearRect(0, 0, CANVAS, CANVAS);
+      // Paredes e saida.
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const ch = MAZE[r][c];
+          if (ch === '#') {
+            mctx.fillStyle = '#2b3446';
+            mctx.fillRect(c * CELL, r * CELL, CELL + 0.5, CELL + 0.5);
+          } else if (ch === 'E') {
+            mctx.fillStyle = '#1f5130';
+            mctx.fillRect(c * CELL, r * CELL, CELL, CELL);
+            mctx.fillStyle = '#51cf66';
+            mctx.beginPath();
+            mctx.arc((c + 0.5) * CELL, (r + 0.5) * CELL, CELL * 0.28, 0, Math.PI * 2);
+            mctx.fill();
+          }
+        }
+      }
+      // Checkpoint (losango amarelo; verde depois de alcancado).
+      {
+        const p = cellCenter(CHECKPOINT);
+        mctx.fillStyle = checkpointReached ? '#51cf66' : '#f5c542';
+        mctx.save();
+        mctx.translate(p.x, p.y);
+        mctx.rotate(Math.PI / 4);
+        const s = CELL * 0.26;
+        mctx.fillRect(-s, -s, s * 2, s * 2);
+        mctx.restore();
+      }
+
+      // Buracos (circulos escuros com borda).
+      for (const h of HOLES) {
+        const p = cellCenter(h);
+        mctx.fillStyle = '#05070c';
+        mctx.beginPath();
+        mctx.arc(p.x, p.y, HOLE_R, 0, Math.PI * 2);
+        mctx.fill();
+        mctx.strokeStyle = '#1a2130';
+        mctx.lineWidth = 2;
+        mctx.stroke();
+      }
+
+      // Bola (escala animada durante a queda).
+      const r = BALL_R * Math.max(ball.scale, 0);
+      if (r > 0.3) {
+        mctx.fillStyle = won ? '#51cf66' : (falling ? '#ff6b6b' : '#4dabf7');
+        mctx.beginPath();
+        mctx.arc(ball.x, ball.y, r, 0, Math.PI * 2);
+        mctx.fill();
+      }
+    }
+
+    requestAnimationFrame(mazeStep);
+    document.getElementById('btnRestart').addEventListener('click', resetMaze);
+    // ============== FIM LABIRINTO ==============
+
+    // ---------- Web Serial ----------
+    const btnConnect = document.getElementById('btnConnect');
+    const btnDisconnect = document.getElementById('btnDisconnect');
+    const statusEl = document.getElementById('status');
+    const rawEl = document.getElementById('raw');
+
+    let port = null;
+    let reader = null;
+    let keepReading = false;
+
+    // Regex tolerante: pega os numeros apos beta=, gamma=, alpha= em qualquer ordem.
+    function parseLine(line) {
+      const get = (key) => {
+        const m = line.match(new RegExp(key + '\\s*=\\s*(-?\\d+(?:\\.\\d+)?)'));
+        return m ? parseFloat(m[1]) : null;
+      };
+      const beta = get('beta'), gamma = get('gamma'), alpha = get('alpha');
+      if (beta === null && gamma === null && alpha === null) return false;
+      if (beta  !== null) { target.beta  = beta;  document.getElementById('vBeta').textContent  = beta.toFixed(1); }
+      if (gamma !== null) { target.gamma = gamma; document.getElementById('vGamma').textContent = gamma.toFixed(1); }
+      if (alpha !== null) { target.alpha = alpha; document.getElementById('vAlpha').textContent = alpha.toFixed(1); }
+      return true;
+    }
+
+    async function connect() {
+      if (!('serial' in navigator)) {
+        statusEl.textContent = 'Web Serial indisponivel. Use Chrome ou Edge no desktop.';
+        return;
+      }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        statusEl.textContent = 'Conectado. Lendo dados...';
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+        keepReading = true;
+        readLoop();
+      } catch (err) {
+        statusEl.textContent = 'Falha ao abrir a porta: ' + err;
+      }
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoderStream();
+      const readableClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+      reader = decoder.readable.getReader();
+      let buffer = '';
+      try {
+        while (keepReading) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += value;
+          let idx;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (line) {
+              rawEl.textContent = line;
+              parseLine(line);
+            }
+          }
+        }
+      } catch (err) {
+        statusEl.textContent = 'Leitura interrompida: ' + err;
+      } finally {
+        try { reader.releaseLock(); } catch (e) {}
+        readableClosed.catch(() => {});
+      }
+    }
+
+    async function disconnect() {
+      keepReading = false;
+      try { if (reader) await reader.cancel(); } catch (e) {}
+      try { if (port) await port.close(); } catch (e) {}
+      port = null; reader = null;
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      statusEl.textContent = 'Desconectado.';
+    }
+
+    btnConnect.addEventListener('click', connect);
+    btnDisconnect.addEventListener('click', disconnect);
+    document.getElementById('btnZero').addEventListener('click', zeroPosition);
+  </script>
+</body>
+</html>
