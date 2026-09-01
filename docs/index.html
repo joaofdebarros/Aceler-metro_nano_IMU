@@ -46,11 +46,20 @@
   <button id="btnStart" class="secondary" disabled>2. Iniciar envio do acelerometro</button>
   <button id="btnStop" class="secondary" disabled>Parar</button>
 
+  <div class="label" style="margin-top:8px">Aceleracao (m/s2, com gravidade)</div>
   <div class="row">
     <div class="card"><div class="label">X</div><div class="value axis-x" id="valX">--</div></div>
     <div class="card"><div class="label">Y</div><div class="value axis-y" id="valY">--</div></div>
     <div class="card"><div class="label">Z</div><div class="value axis-z" id="valZ">--</div></div>
   </div>
+
+  <div class="label">Orientacao (graus)</div>
+  <div class="row">
+    <div class="card"><div class="label">beta (F/T)</div><div class="value axis-x" id="valBeta">--</div></div>
+    <div class="card"><div class="label">gamma (E/D)</div><div class="value axis-y" id="valGamma">--</div></div>
+    <div class="card"><div class="label">alpha (giro)</div><div class="value axis-z" id="valAlpha">--</div></div>
+  </div>
+
   <div class="rate" id="rate">0 pacotes/s</div>
 
   <div id="status">Pronto. Toque em "Conectar".</div>
@@ -73,9 +82,10 @@
     let imuChar = null;
     let sending = false;
     let lastSent = 0;
-    let latest = { x: 0, y: 0, z: 0 };
+    let latest = { x: 0, y: 0, z: 0, beta: 0, gamma: 0, alpha: 0 };
     let packetCount = 0;
     let motionHandler = null;
+    let orientationHandler = null;
 
     function log(msg) {
       const el = $('log');
@@ -138,15 +148,31 @@
         return res === 'granted';
       }
       // Android/Chrome: nao existe requestPermission, acesso liberado.
-      log('requestPermission nao necessario (provavelmente Android).');
+      log('requestPermission (movimento) nao necessario (provavelmente Android).');
+      return true;
+    }
+
+    async function ensureOrientationPermission() {
+      // iOS: permissao de orientacao e separada da de movimento.
+      const DOE = window.DeviceOrientationEvent;
+      if (DOE && typeof DOE.requestPermission === 'function') {
+        const res = await DOE.requestPermission();
+        log('Permissao de orientacao (iOS): ' + res);
+        return res === 'granted';
+      }
+      log('requestPermission (orientacao) nao necessario (provavelmente Android).');
       return true;
     }
 
     async function startStreaming() {
       if (!imuChar) { status('Conecte primeiro.'); return; }
 
-      const ok = await ensureMotionPermission();
-      if (!ok) { status('Permissao de movimento negada.'); return; }
+      // Pede as duas permissoes dentro do mesmo gesto (clique). No iOS ambas
+      // exigem transient activation; chamar em sequencia aqui funciona.
+      const okMotion = await ensureMotionPermission();
+      const okOrient = await ensureOrientationPermission();
+      if (!okMotion) { status('Permissao de movimento negada.'); return; }
+      if (!okOrient) { log('Orientacao negada: seguindo so com aceleracao.'); }
 
       motionHandler = (e) => {
         // includeGravity da a inclinacao total (bom para tilt/labirinto).
@@ -160,6 +186,18 @@
         $('valZ').textContent = latest.z.toFixed(2);
       };
       window.addEventListener('devicemotion', motionHandler);
+
+      orientationHandler = (e) => {
+        // beta: frente/tras (-180..180), gamma: esquerda/direita (-90..90),
+        // alpha: rotacao no plano / bussola (0..360).
+        latest.beta  = e.beta  || 0;
+        latest.gamma = e.gamma || 0;
+        latest.alpha = e.alpha || 0;
+        $('valBeta').textContent  = latest.beta.toFixed(1);
+        $('valGamma').textContent = latest.gamma.toFixed(1);
+        $('valAlpha').textContent = latest.alpha.toFixed(1);
+      };
+      window.addEventListener('deviceorientation', orientationHandler);
 
       sending = true;
       packetCount = 0;
@@ -178,11 +216,14 @@
       if (!sending) return;
       if (imuChar && ts - lastSent >= SEND_INTERVAL_MS) {
         lastSent = ts;
-        const buf = new ArrayBuffer(12);
+        const buf = new ArrayBuffer(24);   // 6 floats little-endian
         const dv = new DataView(buf);
-        dv.setFloat32(0, latest.x, true);  // little-endian
-        dv.setFloat32(4, latest.y, true);
-        dv.setFloat32(8, latest.z, true);
+        dv.setFloat32(0,  latest.x,     true);  // aceleracao
+        dv.setFloat32(4,  latest.y,     true);
+        dv.setFloat32(8,  latest.z,     true);
+        dv.setFloat32(12, latest.beta,  true);  // orientacao
+        dv.setFloat32(16, latest.gamma, true);
+        dv.setFloat32(20, latest.alpha, true);
         try {
           // writeValueWithoutResponse: mais rapido, sem ACK por pacote.
           if (imuChar.writeValueWithoutResponse) {
@@ -203,6 +244,10 @@
       if (motionHandler) {
         window.removeEventListener('devicemotion', motionHandler);
         motionHandler = null;
+      }
+      if (orientationHandler) {
+        window.removeEventListener('deviceorientation', orientationHandler);
+        orientationHandler = null;
       }
       if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
       $('rate').textContent = '0 pacotes/s';

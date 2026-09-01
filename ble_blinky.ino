@@ -25,8 +25,12 @@
 #include <string.h>
 
 // Numero de valores float recebidos por escrita (x, y, z)
-#define IMU_VALUE_COUNT   3
-#define IMU_PAYLOAD_BYTES (IMU_VALUE_COUNT * sizeof(float))  // 12 bytes
+// A caracteristica IMU aceita dois formatos:
+//   - 12 bytes: 3 floats  -> accel x,y,z            (compatibilidade)
+//   - 24 bytes: 6 floats  -> accel x,y,z + orientacao beta,gamma,alpha
+#define IMU_ACCEL_ONLY_BYTES  (3 * sizeof(float))   // 12 bytes
+#define IMU_FULL_BYTES        (6 * sizeof(float))   // 24 bytes
+#define IMU_MAX_BYTES         IMU_FULL_BYTES        // tamanho maximo da caracteristica
 
 static void set_led_on(bool state);
 static void ble_initialize_gatt_db();
@@ -54,30 +58,43 @@ static uint16_t imu_service_handle;
 static uint16_t imu_data_characteristic_handle;
 
 /**************************************************************************//**
- * Decodifica 12 bytes (3 floats little-endian) e imprime x/y/z na Serial.
+ * Decodifica os floats recebidos (little-endian) e imprime na Serial.
+ *   12 bytes -> accel x,y,z
+ *   24 bytes -> accel x,y,z + orientacao beta,gamma,alpha (graus)
  *****************************************************************************/
 static void handle_imu_write(const uint8_t* data, size_t len)
 {
-  if (len != IMU_PAYLOAD_BYTES) {
+  if (len != IMU_ACCEL_ONLY_BYTES && len != IMU_FULL_BYTES) {
     Serial.print("IMU: tamanho inesperado (");
     Serial.print(len);
-    Serial.print(" bytes, esperado ");
-    Serial.print(IMU_PAYLOAD_BYTES);
-    Serial.println(")");
+    Serial.println(" bytes; esperado 12 ou 24)");
     return;
   }
 
-  float xyz[IMU_VALUE_COUNT];
-  // Copia direta: EFR32 (ARM Cortex-M) e o browser usam little-endian, entao
-  // o layout de bytes bate com o float nativo.
-  memcpy(xyz, data, IMU_PAYLOAD_BYTES);
+  // EFR32 (ARM Cortex-M) e o browser usam little-endian, entao o layout de
+  // bytes bate com o float nativo (copia direta).
+  float v[6] = { 0 };
+  memcpy(v, data, len);
 
-  Serial.print("IMU  x=");
-  Serial.print(xyz[0], 3);
+  Serial.print("ACC  x=");
+  Serial.print(v[0], 3);
   Serial.print("  y=");
-  Serial.print(xyz[1], 3);
+  Serial.print(v[1], 3);
   Serial.print("  z=");
-  Serial.println(xyz[2], 3);
+  Serial.print(v[2], 3);
+
+  if (len == IMU_FULL_BYTES) {
+    // beta  = inclinacao frente/tras (-180..180)
+    // gamma = inclinacao esquerda/direita (-90..90)
+    // alpha = bussola / rotacao no plano (0..360)
+    Serial.print("   |  ORI  beta=");
+    Serial.print(v[3], 2);
+    Serial.print("  gamma=");
+    Serial.print(v[4], 2);
+    Serial.print("  alpha=");
+    Serial.print(v[5], 2);
+  }
+  Serial.println();
 
   // Feedback visual: pisca o LED a cada pacote recebido.
   static bool led = false;
@@ -214,21 +231,22 @@ static void ble_initialize_gatt_db()
                                 &imu_service_handle);
   app_assert_status(sc);
 
-  // Caracteristica IMU (Write / Write Without Response): 12 bytes (float x,y,z LE)
+  // Caracteristica IMU (Write / Write Without Response): tamanho variavel.
+  // 12 bytes (accel x,y,z) ou 24 bytes (accel + orientacao), floats LE.
   // UUID: 6d570002-9c8f-4f2b-9b6a-2a1b0c0d0e0f
   const uuid_128 imu_data_characteristic_uuid = {
     .data = { 0x0f, 0x0e, 0x0d, 0x0c, 0x1b, 0x2a, 0x6a, 0x9b, 0x2b, 0x4f, 0x8f, 0x9c, 0x02, 0x00, 0x57, 0x6d }
   };
-  uint8_t imu_init_value[IMU_PAYLOAD_BYTES] = { 0 };
+  uint8_t imu_init_value[IMU_MAX_BYTES] = { 0 };
   sc = sl_bt_gattdb_add_uuid128_characteristic(gattdb_session_id,
                                                imu_service_handle,
                                                SL_BT_GATTDB_CHARACTERISTIC_WRITE | SL_BT_GATTDB_CHARACTERISTIC_WRITE_NO_RESPONSE,
                                                0x00,
                                                0x00,
                                                imu_data_characteristic_uuid,
-                                               sl_bt_gattdb_fixed_length_value,
-                                               IMU_PAYLOAD_BYTES,          // max length
-                                               IMU_PAYLOAD_BYTES,          // initial value length
+                                               sl_bt_gattdb_variable_length_value,
+                                               IMU_MAX_BYTES,              // max length
+                                               IMU_MAX_BYTES,              // initial value length
                                                imu_init_value,             // initial value
                                                &imu_data_characteristic_handle);
   app_assert_status(sc);
