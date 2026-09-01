@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Nano IMU - Acelerometro por BLE</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 16px;
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+      background: #10131a; color: #e6e9ef;
+    }
+    h1 { font-size: 1.15rem; margin: 0 0 12px; }
+    button {
+      width: 100%; padding: 16px; font-size: 1.05rem; font-weight: 600;
+      border: none; border-radius: 12px; margin: 6px 0; cursor: pointer;
+      background: #2f6df6; color: #fff;
+    }
+    button:disabled { background: #333a49; color: #7c8698; cursor: default; }
+    button.secondary { background: #333a49; color: #e6e9ef; }
+    .row { display: flex; gap: 12px; margin: 16px 0; }
+    .card {
+      flex: 1; background: #1a1f2b; border-radius: 12px; padding: 14px 10px;
+      text-align: center;
+    }
+    .card .label { font-size: .8rem; color: #8a93a6; }
+    .card .value { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .axis-x { color: #ff6b6b; } .axis-y { color: #51cf66; } .axis-z { color: #4dabf7; }
+    #status {
+      font-size: .85rem; color: #8a93a6; min-height: 1.2em; margin: 8px 0;
+    }
+    #log {
+      background: #0b0e14; border-radius: 10px; padding: 10px;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .75rem;
+      height: 150px; overflow-y: auto; white-space: pre-wrap; color: #9aa4b8;
+    }
+    .rate { font-size: .8rem; color: #8a93a6; text-align: center; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Nano IMU &mdash; acelerometro por BLE</h1>
+
+  <button id="btnConnect">1. Conectar ao Nano IMU</button>
+  <button id="btnStart" class="secondary" disabled>2. Iniciar envio do acelerometro</button>
+  <button id="btnStop" class="secondary" disabled>Parar</button>
+
+  <div class="row">
+    <div class="card"><div class="label">X</div><div class="value axis-x" id="valX">--</div></div>
+    <div class="card"><div class="label">Y</div><div class="value axis-y" id="valY">--</div></div>
+    <div class="card"><div class="label">Z</div><div class="value axis-z" id="valZ">--</div></div>
+  </div>
+  <div class="rate" id="rate">0 pacotes/s</div>
+
+  <div id="status">Pronto. Toque em "Conectar".</div>
+  <div id="log"></div>
+
+  <script>
+    // Precisam bater com os UUIDs do firmware (ble_blinky.ino), em minusculas.
+    const IMU_SERVICE_UUID = '6d570001-9c8f-4f2b-9b6a-2a1b0c0d0e0f';
+    const IMU_DATA_UUID    = '6d570002-9c8f-4f2b-9b6a-2a1b0c0d0e0f';
+
+    const SEND_HZ = 20;                 // frequencia de envio (Hz)
+    const SEND_INTERVAL_MS = 1000 / SEND_HZ;
+
+    const $ = (id) => document.getElementById(id);
+    const btnConnect = $('btnConnect');
+    const btnStart = $('btnStart');
+    const btnStop = $('btnStop');
+
+    let device = null;
+    let imuChar = null;
+    let sending = false;
+    let lastSent = 0;
+    let latest = { x: 0, y: 0, z: 0 };
+    let packetCount = 0;
+    let motionHandler = null;
+
+    function log(msg) {
+      const el = $('log');
+      const t = new Date().toLocaleTimeString();
+      el.textContent += `[${t}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+    function status(msg) { $('status').textContent = msg; }
+
+    function setUI({ connected, streaming }) {
+      btnConnect.disabled = connected;
+      btnStart.disabled = !connected || streaming;
+      btnStop.disabled = !streaming;
+    }
+
+    // ---- BLE ----
+    async function connect() {
+      if (!navigator.bluetooth) {
+        status('Web Bluetooth indisponivel. No iPhone use o app WebBLE; no Android use o Chrome.');
+        log('navigator.bluetooth ausente.');
+        return;
+      }
+      try {
+        status('Procurando dispositivos...');
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'Nano IMU' }],
+          optionalServices: [IMU_SERVICE_UUID],
+        });
+        device.addEventListener('gattserverdisconnected', onDisconnected);
+
+        status('Conectando...');
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(IMU_SERVICE_UUID);
+        imuChar = await service.getCharacteristic(IMU_DATA_UUID);
+
+        log(`Conectado a ${device.name}.`);
+        status('Conectado. Toque em "Iniciar envio".');
+        setUI({ connected: true, streaming: false });
+      } catch (err) {
+        log('Erro ao conectar: ' + err);
+        status('Falha na conexao. Veja o log.');
+      }
+    }
+
+    function onDisconnected() {
+      log('Dispositivo desconectado.');
+      status('Desconectado. Toque em "Conectar" para reconectar.');
+      stopStreaming();
+      imuChar = null;
+      setUI({ connected: false, streaming: false });
+    }
+
+    // ---- Sensor de movimento ----
+    async function ensureMotionPermission() {
+      // iOS 13+: precisa pedir permissao dentro de um gesto do usuario.
+      const DME = window.DeviceMotionEvent;
+      if (DME && typeof DME.requestPermission === 'function') {
+        const res = await DME.requestPermission();
+        log('Permissao de movimento (iOS): ' + res);
+        return res === 'granted';
+      }
+      // Android/Chrome: nao existe requestPermission, acesso liberado.
+      log('requestPermission nao necessario (provavelmente Android).');
+      return true;
+    }
+
+    async function startStreaming() {
+      if (!imuChar) { status('Conecte primeiro.'); return; }
+
+      const ok = await ensureMotionPermission();
+      if (!ok) { status('Permissao de movimento negada.'); return; }
+
+      motionHandler = (e) => {
+        // includeGravity da a inclinacao total (bom para tilt/labirinto).
+        const a = e.accelerationIncludingGravity || e.acceleration;
+        if (!a) return;
+        latest.x = a.x || 0;
+        latest.y = a.y || 0;
+        latest.z = a.z || 0;
+        $('valX').textContent = latest.x.toFixed(2);
+        $('valY').textContent = latest.y.toFixed(2);
+        $('valZ').textContent = latest.z.toFixed(2);
+      };
+      window.addEventListener('devicemotion', motionHandler);
+
+      sending = true;
+      packetCount = 0;
+      setUI({ connected: true, streaming: true });
+      status('Enviando acelerometro...');
+      requestAnimationFrame(sendLoop);
+      rateTimer = setInterval(() => {
+        $('rate').textContent = packetCount + ' pacotes/s';
+        packetCount = 0;
+      }, 1000);
+    }
+
+    let rateTimer = null;
+
+    async function sendLoop(ts) {
+      if (!sending) return;
+      if (imuChar && ts - lastSent >= SEND_INTERVAL_MS) {
+        lastSent = ts;
+        const buf = new ArrayBuffer(12);
+        const dv = new DataView(buf);
+        dv.setFloat32(0, latest.x, true);  // little-endian
+        dv.setFloat32(4, latest.y, true);
+        dv.setFloat32(8, latest.z, true);
+        try {
+          // writeValueWithoutResponse: mais rapido, sem ACK por pacote.
+          if (imuChar.writeValueWithoutResponse) {
+            await imuChar.writeValueWithoutResponse(buf);
+          } else {
+            await imuChar.writeValue(buf);
+          }
+          packetCount++;
+        } catch (err) {
+          log('Erro no envio: ' + err);
+        }
+      }
+      requestAnimationFrame(sendLoop);
+    }
+
+    function stopStreaming() {
+      sending = false;
+      if (motionHandler) {
+        window.removeEventListener('devicemotion', motionHandler);
+        motionHandler = null;
+      }
+      if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
+      $('rate').textContent = '0 pacotes/s';
+      setUI({ connected: !!imuChar, streaming: false });
+      if (imuChar) status('Envio parado.');
+    }
+
+    btnConnect.addEventListener('click', connect);
+    btnStart.addEventListener('click', startStreaming);
+    btnStop.addEventListener('click', stopStreaming);
+  </script>
+</body>
+</html>
