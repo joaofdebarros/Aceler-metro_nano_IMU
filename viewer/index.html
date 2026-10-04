@@ -42,6 +42,15 @@
     #mazeStatus { font-size: .85rem; color: #8a93a6; margin: 10px 0 6px; min-height: 1.1em; }
     #mazeStatus.win { color: #51cf66; font-weight: 700; }
     .maze-hint { font-size: .72rem; color: #707a8e; line-height: 1.4; margin-top: 8px; }
+
+    #servos {
+      position: fixed; bottom: 16px; left: 16px; z-index: 10;
+      background: rgba(20,24,33,.85); backdrop-filter: blur(8px);
+      border-radius: 14px; padding: 16px; width: 340px; max-width: calc(100vw - 32px);
+    }
+    #servosCanvas { width: 100%; height: auto; display: block; border-radius: 10px;
+      background: #10131a; }
+    .servo-hint { font-size: .72rem; color: #707a8e; line-height: 1.4; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -56,6 +65,16 @@
       A bola (azul) parte do canto e deve chegar na saida (verde). Desvie dos
       buracos escuros: cair reinicia no ultimo checkpoint (losango amarelo).
       A inclinacao neutra e a que voce definiu no botao "Zerar posicao".
+    </div>
+  </div>
+
+  <div id="servos">
+    <h1>Servos (previa do que o Nano vai enviar)</h1>
+    <canvas id="servosCanvas" width="340" height="200"></canvas>
+    <div class="servo-hint">
+      Mesma matematica do firmware: inclinacao de +-30&deg; mapeia para 60&deg;..120&deg;
+      no servo, com suavizacao. beta controla um servo, gamma o outro.
+      A referencia neutra e a do botao "Zerar posicao".
     </div>
   </div>
 
@@ -481,6 +500,89 @@
     requestAnimationFrame(mazeStep);
     document.getElementById('btnRestart').addEventListener('click', resetMaze);
     // ============== FIM LABIRINTO ==============
+
+    // ================= SERVOS (previa) =================
+    // Replica EXATAMENTE a matematica do firmware (ble_blinky.ino, Etapa 4):
+    //   TILT_RANGE_DEG=30, SERVO_RANGE_DEG=30, SERVO_CENTER=90, SMOOTHING=0.20
+    // Assim o angulo mostrado aqui e o mesmo que o Nano enviaria aos SG90.
+    const SV_TILT_RANGE = 30;
+    const SV_RANGE = 30;
+    const SV_CENTER = 90;
+    const SV_SMOOTHING = 0.20;
+
+    const svCanvas = document.getElementById('servosCanvas');
+    const svx = svCanvas.getContext('2d');
+    // Angulos suavizados (comecam no centro, como o firmware).
+    let svBeta = SV_CENTER, svGamma = SV_CENTER;
+
+    function tiltToServo(tiltDeg) {
+      let t = tiltDeg;
+      if (t >  SV_TILT_RANGE) t =  SV_TILT_RANGE;
+      if (t < -SV_TILT_RANGE) t = -SV_TILT_RANGE;
+      return SV_CENTER + (t / SV_TILT_RANGE) * SV_RANGE;
+    }
+
+    // Desenha um servo: corpo + eixo + braco no angulo dado (0..180).
+    function drawOneServo(cx, cy, angleDeg, label, color) {
+      // corpo
+      svx.fillStyle = '#1b2230';
+      svx.fillRect(cx - 34, cy - 6, 68, 44);
+      svx.fillStyle = '#141a24';
+      svx.fillRect(cx - 34, cy - 18, 68, 12);
+      // arco de referencia (0..180 no semicirculo superior)
+      svx.strokeStyle = '#2b3446'; svx.lineWidth = 1;
+      svx.beginPath(); svx.arc(cx, cy, 46, Math.PI, 2 * Math.PI); svx.stroke();
+      // braco: 0deg -> esquerda, 180deg -> direita
+      const ang = Math.PI - (angleDeg / 180) * Math.PI;
+      const ex = cx + Math.cos(ang) * 46;
+      const ey = cy - Math.sin(ang) * 46;
+      svx.strokeStyle = color; svx.lineWidth = 5; svx.lineCap = 'round';
+      svx.beginPath(); svx.moveTo(cx, cy); svx.lineTo(ex, ey); svx.stroke();
+      // eixo
+      svx.fillStyle = '#4dabf7';
+      svx.beginPath(); svx.arc(cx, cy, 5, 0, Math.PI * 2); svx.fill();
+      // rotulos
+      svx.fillStyle = '#8a93a6'; svx.font = '11px system-ui'; svx.textAlign = 'center';
+      svx.fillText(label, cx, cy + 54);
+      svx.fillStyle = '#e6e9ef'; svx.font = 'bold 16px system-ui';
+      svx.fillText(Math.round(angleDeg) + '\u00B0', cx, cy - 26);
+      svx.textAlign = 'start';
+    }
+
+    function servoStep() {
+      requestAnimationFrame(servoStep);
+      // Alvo a partir da inclinacao relativa ao neutro (calibracao compartilhada).
+      const betaTarget  = tiltToServo(target.beta  - mazeNeutral.beta);
+      const gammaTarget = tiltToServo(target.gamma - mazeNeutral.gamma);
+      // Suavizacao exponencial identica a do firmware.
+      svBeta  += (betaTarget  - svBeta)  * SV_SMOOTHING;
+      svGamma += (gammaTarget - svGamma) * SV_SMOOTHING;
+
+      svx.clearRect(0, 0, svCanvas.width, svCanvas.height);
+      drawOneServo(90,  70, svBeta,  'servo beta (D2)',  '#ff6b6b');
+      drawOneServo(250, 70, svGamma, 'servo gamma (D3)', '#51cf66');
+
+      // Mini-plataforma inclinando nos dois eixos (visao pseudo-3D simples).
+      const px0 = 170, py0 = 165, half = 60;
+      // inclinacoes em torno do neutro, limitadas, em radianos
+      const bx = (svGamma - SV_CENTER) / SV_RANGE; // -1..1 (esq/dir)
+      const by = (svBeta  - SV_CENTER) / SV_RANGE; // -1..1 (frente/tras)
+      const dxTilt = bx * 26;   // deslocamento horizontal das bordas
+      const dyTilt = by * 14;   // afundamento vertical (perspectiva)
+      svx.strokeStyle = '#3a4557'; svx.lineWidth = 2;
+      svx.fillStyle = 'rgba(79,109,246,0.18)';
+      svx.beginPath();
+      svx.moveTo(px0 - half + dxTilt, py0 - 18 - dyTilt); // fundo-esq
+      svx.lineTo(px0 + half + dxTilt, py0 - 18 + dyTilt); // fundo-dir
+      svx.lineTo(px0 + half - dxTilt, py0 + 18 + dyTilt); // frente-dir
+      svx.lineTo(px0 - half - dxTilt, py0 + 18 - dyTilt); // frente-esq
+      svx.closePath(); svx.fill(); svx.stroke();
+      svx.fillStyle = '#8a93a6'; svx.font = '11px system-ui'; svx.textAlign = 'center';
+      svx.fillText('plataforma do labirinto', px0, py0 + 34);
+      svx.textAlign = 'start';
+    }
+    requestAnimationFrame(servoStep);
+    // ============== FIM SERVOS ==============
 
     // ---------- Web Serial ----------
     const btnConnect = document.getElementById('btnConnect');

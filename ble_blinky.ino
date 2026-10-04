@@ -32,22 +32,136 @@
 #define IMU_FULL_BYTES        (6 * sizeof(float))   // 24 bytes
 #define IMU_MAX_BYTES         IMU_FULL_BYTES        // tamanho maximo da caracteristica
 
+// ---------------- Servos (Etapa 4) ----------------
+// O core Arduino da Silicon Labs nao usa a lib Servo padrao, entao geramos o
+// pulso PWM na mao: ~50 Hz (periodo de 20 ms), com largura de 1000..2000 us
+// mapeando 0..180 graus (1500 us = 90 graus / centro).
+//
+// Ligacao do SG90:  laranja=sinal -> pino do Nano | vermelho=+5V (FONTE
+// EXTERNA) | marrom=GND. O GND da fonte DEVE ser comum com o GND do Nano.
+// NAO alimente os servos pelo pino 5V da placa.
+#define SERVO_BETA_PIN    D2      // servo controlado por beta  (frente/tras)
+#define SERVO_GAMMA_PIN   D3      // servo controlado por gamma (esquerda/direita)
+
+// Faixa de pulso do SG90. 500..2500 us cobre 0..180 graus na maioria das
+// unidades (a faixa "estreita" 1000..2000 nem sempre alcanca os extremos).
+#define SERVO_MIN_US      500     // largura de pulso p/ 0 grau
+#define SERVO_MAX_US      2500    // largura de pulso p/ 180 graus
+#define SERVO_PERIOD_MS   20      // 50 Hz
+
+// Faixa de inclinacao do celular usada e faixa correspondente no servo.
+// +-TILT_RANGE graus de inclinacao -> +-SERVO_RANGE graus em torno de 90.
+// Movimento limitado a 60..120 graus para conter a oscilacao com peso.
+#define TILT_RANGE_DEG    30.0f   // inclinacao do celular que satura o servo
+#define SERVO_RANGE_DEG   30.0f   // amplitude do servo em torno do centro (90)
+#define SERVO_CENTER_DEG  90.0f
+
+// Limites fisicos absolutos do servo (trava de seguranca).
+#define SERVO_MIN_ANGLE   60.0f
+#define SERVO_MAX_ANGLE   120.0f
+
+#define SMOOTHING         0.08f   // filtro exponencial (0..1); menor = mais suave
+#define DEADBAND_DEG      0.5f    // ignora mudancas de angulo menores que isto (anti-tremor)
+
+// Inversao de sentido por eixo. Ambos invertidos.
+#define INVERT_BETA       true
+#define INVERT_GAMMA      true
+
+// Calibracao do centro de cada servo (offset mecanico), em RAM.
+// Quando o celular esta na inclinacao gravada, o servo fica no centro.
+// Ajustados em tempo real por comando BLE de 1 byte vindo do celular:
+//   0x01 -> calibra beta  (centro = inclinacao atual)
+//   0x02 -> calibra gamma (centro = inclinacao atual)
+static float beta_center_offset = 0.0f;
+static float gamma_center_offset = 0.0f;
+
 static void set_led_on(bool state);
 static void ble_initialize_gatt_db();
 static void ble_start_advertising();
+static void servo_write_pulse(uint8_t pin, float angle_deg);
+
+// Angulos-alvo (vindos do sensor, ja mapeados) e angulos atuais (suavizados).
+static volatile float target_beta_deg = 0.0f;   // inclinacao recebida
+static volatile float target_gamma_deg = 0.0f;
+static float servo_beta_angle = SERVO_CENTER_DEG;
+static float servo_gamma_angle = SERVO_CENTER_DEG;
 
 void setup()
 {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LED_BUILTIN_INACTIVE);
   set_led_on(false);
+
+  pinMode(SERVO_BETA_PIN, OUTPUT);
+  pinMode(SERVO_GAMMA_PIN, OUTPUT);
+  digitalWrite(SERVO_BETA_PIN, LOW);
+  digitalWrite(SERVO_GAMMA_PIN, LOW);
+
   Serial.begin(115200);
-  Serial.println("Silicon Labs BLE IMU receiver - Etapa 1");
+  Serial.println("Silicon Labs BLE IMU receiver + servos - Etapa 4");
+}
+
+// Converte uma inclinacao (graus) do celular no angulo de servo correspondente.
+//  - offset: centro mecanico calibrado (a inclinacao e medida em relacao a ele)
+//  - invert: inverte o sentido do movimento
+// Aplica saturacao na faixa util.
+static float tilt_to_servo_angle(float tilt_deg, float offset, bool invert)
+{
+  float t = tilt_deg - offset;        // inclinacao relativa ao centro calibrado
+  if (invert) t = -t;
+  if (t >  TILT_RANGE_DEG) t =  TILT_RANGE_DEG;
+  if (t < -TILT_RANGE_DEG) t = -TILT_RANGE_DEG;
+  return SERVO_CENTER_DEG + (t / TILT_RANGE_DEG) * SERVO_RANGE_DEG;
+}
+
+// Gera um unico pulso de servo no pino (largura conforme o angulo).
+// O trecho do pulso roda com interrupcoes desativadas para o radio BLE nao
+// "esticar" o pulso no meio (essa e a principal causa do tremor/jitter).
+// O pulso dura no maximo ~2.5 ms, curto o suficiente para nao afetar o BLE.
+static void servo_write_pulse(uint8_t pin, float angle_deg)
+{
+  if (angle_deg < 0)   angle_deg = 0;
+  if (angle_deg > 180) angle_deg = 180;
+  uint16_t pulse_us = SERVO_MIN_US +
+    (uint16_t)((angle_deg / 180.0f) * (SERVO_MAX_US - SERVO_MIN_US));
+  noInterrupts();
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(pulse_us);
+  digitalWrite(pin, LOW);
+  interrupts();
 }
 
 void loop()
 {
-  // Todo o trabalho acontece no handler de eventos BLE (sl_bt_on_event).
+  // A cada periodo (~20 ms) suaviza os angulos e emite um pulso para cada servo.
+  static uint32_t last_frame_ms = 0;
+  uint32_t now = millis();
+  if (now - last_frame_ms < SERVO_PERIOD_MS) {
+    return;
+  }
+  last_frame_ms = now;
+
+  // Alvo mapeado a partir da inclinacao recebida por BLE, aplicando o centro
+  // calibrado e a inversao de cada eixo.
+  float beta_target  = tilt_to_servo_angle(target_beta_deg,  beta_center_offset,  INVERT_BETA);
+  float gamma_target = tilt_to_servo_angle(target_gamma_deg, gamma_center_offset, INVERT_GAMMA);
+
+  // Zona morta: so persegue o alvo se a diferenca for relevante. Isso evita
+  // que o servo fique "cacando" micro-variacoes do sensor (tremor parado).
+  if (fabsf(beta_target - servo_beta_angle) > DEADBAND_DEG) {
+    servo_beta_angle += (beta_target - servo_beta_angle) * SMOOTHING;
+  }
+  if (fabsf(gamma_target - servo_gamma_angle) > DEADBAND_DEG) {
+    servo_gamma_angle += (gamma_target - servo_gamma_angle) * SMOOTHING;
+  }
+
+  // Trava de seguranca: nunca sair de 60..120 graus, independente da conta.
+  servo_beta_angle  = constrain(servo_beta_angle,  SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+  servo_gamma_angle = constrain(servo_gamma_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+
+  // Emite os pulsos (um servo apos o outro; total < ~4 ms).
+  servo_write_pulse(SERVO_BETA_PIN,  servo_beta_angle);
+  servo_write_pulse(SERVO_GAMMA_PIN, servo_gamma_angle);
 }
 
 static const uint8_t advertised_name[] = "Nano IMU";
@@ -62,12 +176,36 @@ static uint16_t imu_data_characteristic_handle;
  *   12 bytes -> accel x,y,z
  *   24 bytes -> accel x,y,z + orientacao beta,gamma,alpha (graus)
  *****************************************************************************/
+// Comandos de 1 byte enviados pelo celular (via mesma caracteristica BLE).
+#define CMD_CALIBRATE_BETA   0x01
+#define CMD_CALIBRATE_GAMMA  0x02
+#define CMD_CALIBRATE_BOTH   0x03
+
 static void handle_imu_write(const uint8_t* data, size_t len)
 {
+  // Pacote de 1 byte = comando de calibracao (nao e dado de sensor).
+  if (len == 1) {
+    uint8_t cmd = data[0];
+    if (cmd == CMD_CALIBRATE_BETA || cmd == CMD_CALIBRATE_BOTH) {
+      // O centro do beta passa a ser a inclinacao atual do celular.
+      beta_center_offset = target_beta_deg;
+      Serial.print("CALIBRADO beta: centro = inclinacao atual (");
+      Serial.print(target_beta_deg, 2);
+      Serial.println(" graus)");
+    }
+    if (cmd == CMD_CALIBRATE_GAMMA || cmd == CMD_CALIBRATE_BOTH) {
+      gamma_center_offset = target_gamma_deg;
+      Serial.print("CALIBRADO gamma: centro = inclinacao atual (");
+      Serial.print(target_gamma_deg, 2);
+      Serial.println(" graus)");
+    }
+    return;
+  }
+
   if (len != IMU_ACCEL_ONLY_BYTES && len != IMU_FULL_BYTES) {
     Serial.print("IMU: tamanho inesperado (");
     Serial.print(len);
-    Serial.println(" bytes; esperado 12 ou 24)");
+    Serial.println(" bytes; esperado 1, 12 ou 24)");
     return;
   }
 
@@ -86,13 +224,17 @@ static void handle_imu_write(const uint8_t* data, size_t len)
   if (len == IMU_FULL_BYTES) {
     // beta  = inclinacao frente/tras (-180..180)
     // gamma = inclinacao esquerda/direita (-90..90)
-    // alpha = bussola / rotacao no plano (0..360)
+    // alpha = bussola / rotacao no plano (0..360)  -> nao usado nos servos
     Serial.print("   |  ORI  beta=");
     Serial.print(v[3], 2);
     Serial.print("  gamma=");
     Serial.print(v[4], 2);
     Serial.print("  alpha=");
     Serial.print(v[5], 2);
+
+    // Atualiza os alvos dos servos (o loop() faz a suavizacao e gera o pulso).
+    target_beta_deg  = v[3];
+    target_gamma_deg = v[4];
   }
   Serial.println();
 

@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Como o pulso controla o angulo do servo (SG90)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+      background: #0f1115; color: #e6e9ef; line-height: 1.55;
+      max-width: 920px; margin: 0 auto;
+    }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.15rem; margin-top: 32px; color: #cdd3df; }
+    p { color: #c2c8d4; }
+    code { background: #1a1f2b; padding: 2px 6px; border-radius: 5px;
+      font-family: ui-monospace, Consolas, monospace; font-size: .9em; color: #9ecbff; }
+    .card { background: #161a23; border: 1px solid #232a38; border-radius: 14px;
+      padding: 20px; margin: 18px 0; }
+    .axis-x { color: #ff6b6b; } .axis-y { color: #51cf66; }
+    .demo { display: grid; grid-template-columns: 1fr 220px; gap: 20px; align-items: center; }
+    @media (max-width: 680px) { .demo { grid-template-columns: 1fr; } }
+    canvas { width: 100%; height: auto; display: block; background: #0b0e14;
+      border-radius: 10px; }
+    .readouts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .pill { background: #10131a; border-radius: 8px; padding: 8px 12px; }
+    .pill .k { font-size: .72rem; color: #8a93a6; display: block; }
+    .pill .v { font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    input[type=range] { width: 100%; margin-top: 14px; accent-color: #4dabf7; }
+    .servo-box { text-align: center; }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+    th, td { border: 1px solid #232a38; padding: 8px 10px; text-align: left; font-size: .9rem; }
+    th { background: #1a1f2b; color: #cdd3df; }
+    .hl { color: #f5c542; }
+    .note { font-size: .88rem; color: #8a93a6; border-left: 3px solid #2f6df6;
+      padding-left: 12px; margin: 14px 0; }
+    ul { color: #c2c8d4; }
+  </style>
+</head>
+<body>
+  <h1>Como o pulso controla o angulo do servo (SG90)</h1>
+  <p>
+    Um servo como o SG90 nao recebe "o angulo" diretamente. Ele recebe um
+    <strong>trem de pulsos</strong> repetido a cada ~20&nbsp;ms (50&nbsp;Hz).
+    O que define o angulo e a <strong>largura</strong> de cada pulso, nao a
+    tensao nem a frequencia. Arraste o controle abaixo e veja o braco girar.
+  </p>
+
+  <div class="card">
+    <div class="demo">
+      <div>
+        <canvas id="pulse" width="640" height="220"></canvas>
+        <input id="slider" type="range" min="500" max="2500" step="10" value="1500" />
+        <div class="readouts">
+          <div class="pill"><span class="k">Largura do pulso</span><span class="v"><span id="us">1500</span> us</span></div>
+          <div class="pill"><span class="k">Angulo</span><span class="v"><span id="deg">90</span>&deg;</span></div>
+          <div class="pill"><span class="k">Periodo</span><span class="v">20 ms (50 Hz)</span></div>
+          <div class="pill"><span class="k">Duty cycle</span><span class="v"><span id="duty">7.5</span>%</span></div>
+        </div>
+      </div>
+      <div class="servo-box">
+        <canvas id="servo" width="220" height="220"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <h2>Os tres numeros que importam</h2>
+  <table>
+    <tr><th>Largura do pulso</th><th>Angulo do eixo</th><th>Significado</th></tr>
+    <tr><td>~1000 us</td><td>0&deg;</td><td>Um extremo</td></tr>
+    <tr><td>1500 us</td><td>90&deg;</td><td class="hl">Centro (posicao neutra)</td></tr>
+    <tr><td>~2000 us</td><td>180&deg;</td><td>Outro extremo</td></tr>
+  </table>
+  <p class="note">
+    Os valores 1000 e 2000&nbsp;us sao os que usamos no firmware
+    (<code>SERVO_MIN_US</code> e <code>SERVO_MAX_US</code>). O padrao "classico"
+    do SG90 costuma ser citado como 544&ndash;2400&nbsp;us; 1000&ndash;2000 e uma
+    faixa conservadora e segura que evita forcar o servo nos batentes.
+  </p>
+
+  <h2>A conta (a mesma do firmware)</h2>
+  <p>
+    Para um angulo de 0 a 180&deg;, a largura do pulso e uma interpolacao linear
+    entre o minimo e o maximo:
+  </p>
+  <div class="card">
+    <code>pulso_us = SERVO_MIN_US + (angulo / 180) &times; (SERVO_MAX_US &minus; SERVO_MIN_US)</code>
+  </div>
+  <p>
+    E no seu projeto o angulo vem da inclinacao do celular, tambem por
+    interpolacao linear, limitada a uma faixa util:
+  </p>
+  <div class="card">
+    <code>angulo = 90 + (inclinacao / TILT_RANGE) &times; SERVO_RANGE</code>
+  </div>
+
+  <h2>Por que gerar o pulso "na mao"</h2>
+  <p>
+    No core Arduino da Silicon Labs (Nano Matter) nao usamos a biblioteca
+    <code>Servo</code> padrao. Em vez disso, o codigo liga o pino
+    (<code>HIGH</code>), espera a largura calculada com
+    <code>delayMicroseconds()</code>, e desliga (<code>LOW</code>). Isso e
+    repetido a cada 20&nbsp;ms:
+  </p>
+  <div class="card">
+    <code>digitalWrite(pino, HIGH); delayMicroseconds(pulso_us); digitalWrite(pino, LOW);</code>
+  </div>
+  <ul>
+    <li>O pulso dura no maximo ~2&nbsp;ms, entao ele quase nao rouba tempo do BLE.</li>
+    <li>O intervalo entre pulsos (os ~18&nbsp;ms restantes) fica livre para o resto do programa.</li>
+    <li>Se o servo tremer (jitter), e porque esses pulsos podem sair irregulares; a solucao seria usar um timer de hardware.</li>
+  </ul>
+
+  <h2>Resumo visual do sinal</h2>
+  <div class="card">
+    <canvas id="train" width="640" height="160"></canvas>
+    <p class="note">
+      Tres periodos consecutivos. A <span class="axis-y">parte alta</span> e o
+      pulso (1&ndash;2&nbsp;ms); o resto de cada janela de 20&nbsp;ms fica baixo.
+      Note como a largura muda com o angulo, mas o periodo (20&nbsp;ms) nunca muda.
+    </p>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    // Faixa de mapeamento (igual ao firmware).
+    const MIN_US = 1000, MAX_US = 2000;
+    const usToDeg = (us) => Math.round(((us - MIN_US) / (MAX_US - MIN_US)) * 180);
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+    // ---- Canvas do pulso (um periodo de 20 ms) ----
+    const pc = $('pulse'), px = pc.getContext('2d');
+    // ---- Canvas do servo (braco) ----
+    const sc = $('servo'), sx = sc.getContext('2d');
+    // ---- Canvas do trem de pulsos ----
+    const tc = $('train'), tx = tc.getContext('2d');
+
+    function drawPulse(us) {
+      const W = pc.width, H = pc.height, pad = 34;
+      px.clearRect(0, 0, W, H);
+      // eixos
+      px.strokeStyle = '#2b3446'; px.lineWidth = 1;
+      px.beginPath(); px.moveTo(pad, H - pad); px.lineTo(W - 8, H - pad); px.stroke(); // x
+      px.beginPath(); px.moveTo(pad, 12); px.lineTo(pad, H - pad); px.stroke();        // y
+      px.fillStyle = '#8a93a6'; px.font = '12px system-ui';
+      px.fillText('tensao', pad - 28, 16);
+      px.fillText('tempo (0 a 20 ms = 1 periodo)', pad + 6, H - 10);
+
+      const period = 20000; // us mostrados no eixo (20 ms)
+      const x0 = pad, x1 = W - 8, span = x1 - x0;
+      const yHigh = 30, yLow = H - pad;
+      const xOf = (t) => x0 + (t / period) * span;
+
+      // pulso alto de 0..us, baixo depois
+      px.strokeStyle = '#51cf66'; px.lineWidth = 3;
+      px.beginPath();
+      px.moveTo(xOf(0), yLow);
+      px.lineTo(xOf(0), yHigh);
+      px.lineTo(xOf(us), yHigh);
+      px.lineTo(xOf(us), yLow);
+      px.lineTo(xOf(period), yLow);
+      px.stroke();
+
+      // marca da largura
+      px.strokeStyle = '#f5c542'; px.setLineDash([4, 4]); px.lineWidth = 1;
+      px.beginPath(); px.moveTo(xOf(us), yHigh); px.lineTo(xOf(us), yLow); px.stroke();
+      px.setLineDash([]);
+      px.fillStyle = '#f5c542';
+      px.fillText(us + ' us', xOf(us) + 6, yHigh + 14);
+    }
+
+    function drawServo(deg) {
+      const W = sc.width, H = sc.height, cx = W / 2, cy = H / 2 + 30, len = 78;
+      sx.clearRect(0, 0, W, H);
+      // corpo
+      sx.fillStyle = '#1b2230';
+      sx.fillRect(cx - 45, cy - 8, 90, 60);
+      // pino central
+      sx.fillStyle = '#4dabf7';
+      sx.beginPath(); sx.arc(cx, cy, 7, 0, Math.PI * 2); sx.fill();
+      // braco: 0deg aponta para a esquerda, 180 para a direita (semicirculo p/ cima)
+      const ang = Math.PI - (deg / 180) * Math.PI; // 0->PI(esq), 180->0(dir)
+      const ex = cx + Math.cos(ang) * len;
+      const ey = cy - Math.sin(ang) * len;
+      sx.strokeStyle = '#ff6b6b'; sx.lineWidth = 6; sx.lineCap = 'round';
+      sx.beginPath(); sx.moveTo(cx, cy); sx.lineTo(ex, ey); sx.stroke();
+      // arco de referencia
+      sx.strokeStyle = '#2b3446'; sx.lineWidth = 1;
+      sx.beginPath(); sx.arc(cx, cy, len, Math.PI, 2 * Math.PI); sx.stroke();
+      sx.fillStyle = '#8a93a6'; sx.font = '12px system-ui';
+      sx.fillText('0deg', cx - len - 6, cy + 4);
+      sx.fillText('180deg', cx + len - 18, cy + 4);
+      sx.fillStyle = '#e6e9ef'; sx.font = 'bold 20px system-ui';
+      sx.fillText(deg + 'deg', cx - 16, cy - 40);
+    }
+
+    function drawTrain(us) {
+      const W = tc.width, H = tc.height;
+      tx.clearRect(0, 0, W, H);
+      const yHigh = 30, yLow = H - 30;
+      const period = W / 3;              // 3 periodos na largura
+      const pulseFrac = us / 20000;      // fracao do periodo que fica alto
+      tx.strokeStyle = '#51cf66'; tx.lineWidth = 3; tx.beginPath();
+      tx.moveTo(0, yLow);
+      for (let i = 0; i < 3; i++) {
+        const x = i * period;
+        const w = period * pulseFrac;
+        tx.lineTo(x, yLow);
+        tx.lineTo(x, yHigh);
+        tx.lineTo(x + w, yHigh);
+        tx.lineTo(x + w, yLow);
+      }
+      tx.lineTo(W, yLow);
+      tx.stroke();
+      tx.fillStyle = '#8a93a6'; tx.font = '12px system-ui';
+      for (let i = 0; i < 3; i++) tx.fillText('20 ms', i * period + 6, yLow + 18);
+    }
+
+    function update(us) {
+      us = clamp(us, 500, 2500);
+      const deg = clamp(usToDeg(us), 0, 180);
+      $('us').textContent = us;
+      $('deg').textContent = deg;
+      $('duty').textContent = (us / 20000 * 100).toFixed(1);
+      drawPulse(us);
+      drawServo(deg);
+      drawTrain(us);
+    }
+
+    $('slider').addEventListener('input', (e) => update(parseInt(e.target.value, 10)));
+    update(1500);
+  </script>
+</body>
+</html>
